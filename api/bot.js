@@ -14,7 +14,7 @@ async function sendMessage(chatId, text) {
   });
 }
 
-// Запись в Cloudflare KV
+// Запись в Cloudflare KV с детальной отладкой
 async function putToKV(key, value) {
   const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_NAMESPACE_ID}/values/${encodeURIComponent(key)}`;
   const stringBody = typeof value === "string" ? value : JSON.stringify(value);
@@ -27,7 +27,12 @@ async function putToKV(key, value) {
     },
     body: stringBody
   });
-  return res.ok;
+
+  if (!res.ok) {
+    const errorDetails = await res.text();
+    return { ok: false, error: `${res.status}: ${errorDetails}` };
+  }
+  return { ok: true };
 }
 
 // Чтение из Cloudflare KV
@@ -53,7 +58,7 @@ async function deleteFromKV(key) {
   });
 }
 
-// Парсинг DD.MM.YYYY с подстановкой времени отправки сообщения
+// Парсинг даты DD.MM.YYYY с подстановкой времени отправки сообщения
 function parseExpiry(text, nowTimestamp) {
   const now = new Date(nowTimestamp * 1000);
 
@@ -151,20 +156,20 @@ export default async function handler(req, res) {
       const recordKey = `sub::${Date.now()}`;
 
       // Сохраняем пачку в Cloudflare KV
-      const saved = await putToKV(recordKey, {
+      const saveResult = await putToKV(recordKey, {
         expireAt: expireAt,
         keys: pendingData.keys
       });
 
-      if (!saved) {
+      if (!saveResult.ok) {
         await sendMessage(
           msg.chat.id,
-          "❌ <b>Не удалось сохранить в Cloudflare KV!</b>\nПроверь права CF_API_TOKEN и значения переменных."
+          `❌ <b>Не удалось сохранить подписку в KV:</b>\n<code>${saveResult.error}</code>`
         );
         return res.status(200).send("OK");
       }
 
-      // Удаляем временное состояние
+      // Удаляем буфер
       await deleteFromKV(`pending::${ADMIN_ID}`);
 
       const expDateObj = new Date(expireAt * 1000);
@@ -192,12 +197,12 @@ export default async function handler(req, res) {
     }
 
     // Записываем ключи в буфер ожидания
-    const buffered = await putToKV(`pending::${ADMIN_ID}`, { keys: foundKeys });
+    const saveResult = await putToKV(`pending::${ADMIN_ID}`, { keys: foundKeys });
 
-    if (!buffered) {
+    if (!saveResult.ok) {
       await sendMessage(
         msg.chat.id,
-        "❌ <b>Ошибка записи в Cloudflare KV!</b>\nПроверь права CF_API_TOKEN (нужен Workers KV Storage -> Edit)."
+        `❌ <b>Ошибка записи в Cloudflare KV:</b>\n<code>${saveResult.error}</code>`
       );
       return res.status(200).send("OK");
     }
