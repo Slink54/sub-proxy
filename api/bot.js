@@ -14,7 +14,7 @@ async function sendMessage(chatId, text) {
   });
 }
 
-// Запись в Cloudflare KV с детальной отладкой
+// Запись в Cloudflare KV с обработкой ошибок
 async function putToKV(key, value) {
   const url = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/storage/kv/namespaces/${CF_NAMESPACE_ID}/values/${encodeURIComponent(key)}`;
   const stringBody = typeof value === "string" ? value : JSON.stringify(value);
@@ -58,11 +58,13 @@ async function deleteFromKV(key) {
   });
 }
 
-// Парсинг даты DD.MM.YYYY с подстановкой времени отправки сообщения
+// Универсальный парсинг даты, минут и дней
 function parseExpiry(text, nowTimestamp) {
   const now = new Date(nowTimestamp * 1000);
+  const cleanText = text.trim().toLowerCase();
 
-  const dateMatch = text.match(/^(\d{1,2})[./](\d{1,2})[./](\d{4})$/);
+  // 1. Формат даты: ДД.ММ.ГГГГ или ДД/ММ/ГГГГ
+  const dateMatch = cleanText.match(/^(\d{1,2})[./](\d{1,2})[./](\d{4})$/);
   if (dateMatch) {
     const day = parseInt(dateMatch[1], 10);
     const month = parseInt(dateMatch[2], 10) - 1;
@@ -78,16 +80,27 @@ function parseExpiry(text, nowTimestamp) {
     );
 
     const targetTimestamp = Math.floor(targetDate.getTime() / 1000);
-
     if (!isNaN(targetTimestamp) && targetTimestamp > nowTimestamp) {
       return targetTimestamp;
     }
   }
 
-  const relMatch = text.match(/^(\d+)\s*(d|д|day|дней|дня)?$/i);
-  if (relMatch) {
-    const days = parseInt(relMatch[1], 10);
-    return nowTimestamp + days * 86400;
+  // 2. Минуты: 10m, 10мин, 10м, 10min, 10minutes
+  const minMatch = cleanText.match(/^(\d+)\s*(m|мин|м|min|minute|minutes)$/i);
+  if (minMatch) {
+    const minutes = parseInt(minMatch[1], 10);
+    if (minutes > 0) {
+      return nowTimestamp + minutes * 60;
+    }
+  }
+
+  // 3. Дни: 1d, 3дня, 5дней или просто число без букв (например, "7")
+  const dayMatch = cleanText.match(/^(\d+)\s*(d|д|day|days|дней|дня|день)?$/i);
+  if (dayMatch) {
+    const days = parseInt(dayMatch[1], 10);
+    if (days > 0) {
+      return nowTimestamp + days * 86400;
+    }
   }
 
   return null;
@@ -106,7 +119,7 @@ export default async function handler(req, res) {
       return res.status(200).send("OK");
     }
 
-    // Защита: только твой Telegram ID
+    // Защита доступа по ADMIN_ID
     if (msg.from.id !== ADMIN_ID) {
       await sendMessage(msg.chat.id, "⛔ Доступ запрещён.");
       return res.status(200).send("OK");
@@ -122,14 +135,16 @@ export default async function handler(req, res) {
         msg.chat.id,
         "👋 <b>VPN Bot готов к работе</b>\n\n" +
         "1. Отправь мне сообщение с ключами (<code>vless://...</code>).\n" +
-        "2. Следующим шагом напиши дату окончания в формате <b>DD.MM.YYYY</b>.\n" +
-        "<i>(Часы, минуты и секунды будут взяты из времени твоего сообщения)</i>\n\n" +
+        "2. Следующим шагом напиши срок действия:\n" +
+        "   • Минуты: <code>10m</code> или <code>10мин</code>\n" +
+        "   • Дни: <code>3d</code> или <code>7</code>\n" +
+        "   • Конкретная дата: <b>DD.MM.YYYY</b>\n\n" +
         "Команда /cancel сбрасывает текущее ожидание."
       );
       return res.status(200).send("OK");
     }
 
-    // 1. Проверяем: ожидает ли бот ввод даты
+    // 1. Проверяем, ожидает ли бот ввод даты / минут
     const pendingRaw = await getFromKV(`pending::${ADMIN_ID}`);
 
     if (pendingRaw) {
@@ -138,9 +153,11 @@ export default async function handler(req, res) {
       if (!expireAt) {
         await sendMessage(
           msg.chat.id,
-          "⚠️ Неверный формат даты или дата уже прошла.\n\n" +
-          "Пришли дату в формате <b>ДД.ММ.ГГГГ</b> (например: <code>15.10.2026</code>) " +
-          "или количество дней (например: <code>10d</code>).\n\n" +
+          "⚠️ Неверный формат срока или указанное время уже истекло.\n\n" +
+          "Примеры корректного ввода:\n" +
+          "• <code>10m</code> (на 10 минут)\n" +
+          "• <code>3d</code> (на 3 дня)\n" +
+          "• <code>27.09.2026</code> (до конкретной даты)\n\n" +
           "Для отмены нажми /cancel."
         );
         return res.status(200).send("OK");
@@ -155,7 +172,7 @@ export default async function handler(req, res) {
 
       const recordKey = `sub::${Date.now()}`;
 
-      // Сохраняем пачку в Cloudflare KV
+      // Сохраняем пачку ключей в Cloudflare KV
       const saveResult = await putToKV(recordKey, {
         expireAt: expireAt,
         keys: pendingData.keys
@@ -169,7 +186,7 @@ export default async function handler(req, res) {
         return res.status(200).send("OK");
       }
 
-      // Удаляем буфер
+      // Очищаем буфер ожидания
       await deleteFromKV(`pending::${ADMIN_ID}`);
 
       const expDateObj = new Date(expireAt * 1000);
@@ -210,7 +227,7 @@ export default async function handler(req, res) {
     await sendMessage(
       msg.chat.id,
       `📥 <b>Найдено ключей: ${foundKeys.length}</b>\n\n` +
-      `Пришли дату окончания в формате <b>ДД.ММ.ГГГГ</b> (например: <code>27.09.2026</code>):`
+      `Пришли срок действия: минуты (<code>10m</code>), дни (<code>3d</code>) или дату (<b>ДД.ММ.ГГГГ</b>):`
     );
 
     return res.status(200).send("OK");
