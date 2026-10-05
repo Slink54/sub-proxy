@@ -313,7 +313,7 @@ export default async function handler(req, res) {
     // В. Если отправлена ссылка на подписку (https://...)
     if (foundKeys.length === 0 && /^https?:\/\//i.test(text)) {
       try {
-        const subRes = await fetch(text, { headers: { "User-Agent": "Happ/v2ray" } });
+        const subRes = await fetch(text, { headers: { "User-Agent": "Happ/sing-box" } });
         if (subRes.ok) {
           const rawText = (await subRes.text()).trim();
           let decoded = rawText;
