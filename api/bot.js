@@ -200,7 +200,7 @@ export default async function handler(req, res) {
       return res.status(200).send("OK");
     }
 
-    // Проверка прав доступа (ADMIN_ID)
+    // Проверка доступа администратора
     if (msg.from.id !== ADMIN_ID) {
       await sendMessage(msg.chat.id, "⛔ Доступ запрещён.");
       return res.status(200).send("OK");
@@ -209,20 +209,20 @@ export default async function handler(req, res) {
     const msgTimestamp = msg.date || Math.floor(Date.now() / 1000);
     let text = (msg.text || msg.caption || "").trim();
 
-    // Команды /start и /cancel
+    // Сброс и помощь
     if (text === "/start" || text === "/cancel") {
       await deleteFromKV(`pending::${ADMIN_ID}`);
       await sendMessage(
         msg.chat.id,
         "👋 <b>VPN Bot готов к работе!</b>\n\n" +
-        "1. Отправьте ключи (<code>vless://...</code>), ссылку на подписку или прикрепите <b>.json</b> файл.\n" +
-        "2. Следующим шагом укажите срок действия (<b>ДД.ММ.ГГГГ</b>, <code>3d</code> или <code>10m</code>).\n\n" +
+        "1. Отправьте ссылку на подписку, файл <b>.json</b> или ключи (<code>vless://...</code>).\n" +
+        "2. Следующим сообщением пришлите дату окончания (<b>ДД.ММ.ГГГГ</b>, <code>3d</code> или <code>10m</code>).\n\n" +
         "Для отмены используйте команду /cancel."
       );
       return res.status(200).send("OK");
     }
 
-    // Шаг 2: Проверяем, ожидает ли бот ввода даты
+    // Шаг 2: Ожидание ввода даты для сохранённых ключей
     const pendingRaw = await getFromKV(`pending::${ADMIN_ID}`);
 
     if (pendingRaw && text && !msg.document) {
@@ -272,16 +272,16 @@ export default async function handler(req, res) {
         `✅ <b>Успешно сохранено!</b>\n\n` +
         `• Добавлено ключей: <b>${pendingData.keys.length}</b>\n` +
         `• Действуют до: <b>${dateStr} ${timeStr}</b>\n\n` +
-        `Серверы готовы для обновления в приложении Happ.`
+        `Серверы готовы для обновления в Happ.`
       );
 
       return res.status(200).send("OK");
     }
 
-    // Шаг 1: Извлечение ключей из текста, JSON или прикрепленного файла
+    // Шаг 1: Извлечение серверов
     let foundKeys = [];
 
-    // А. Если прикреплен файл (.json)
+    // А. Прикреплённый файл (.json)
     if (msg.document) {
       const fileId = msg.document.file_id;
       const getFileRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`);
@@ -302,7 +302,52 @@ export default async function handler(req, res) {
       }
     }
 
-    // Б. Если отправлен текст в формате JSON
+    // Б. Ссылка на подписку (https://...)
+    // Очищаем ссылку от переносов строк внутри сообщения
+    const cleanedTextUrl = text.replace(/\s+/g, "");
+    const urlMatch = cleanedTextUrl.match(/https?:\/\/[^\s]+/i);
+
+    if (foundKeys.length === 0 && urlMatch) {
+      try {
+        const targetUrl = urlMatch[0];
+        const subRes = await fetch(targetUrl, {
+          redirect: "follow",
+          headers: {
+            "User-Agent": "Happ/sing-box",
+            "Accept": "application/json, text/plain, */*"
+          }
+        });
+
+        if (subRes.ok) {
+          const rawText = (await subRes.text()).trim();
+
+          // Проверяем: прямой JSON или Base64-JSON
+          let parsed = null;
+          try {
+            parsed = JSON.parse(rawText);
+          } catch (e) {
+            try {
+              const decoded = atob(rawText);
+              parsed = JSON.parse(decoded);
+            } catch (e2) {}
+          }
+
+          if (parsed) {
+            foundKeys.push(...extractKeysFromJson(parsed));
+          }
+
+          // Если JSON не подошел, ищем текстовые протоколы
+          if (foundKeys.length === 0) {
+            let plainText = rawText;
+            try { plainText = atob(rawText); } catch (e) {}
+            const regex = /(vless|vmess|hysteria2|ss|trojan):\/\/[^\s<>'"]+/gi;
+            foundKeys.push(...(plainText.match(regex) || []));
+          }
+        }
+      } catch (e) {}
+    }
+
+    // В. Текст в формате JSON
     if (foundKeys.length === 0 && text.startsWith("{")) {
       try {
         const parsedRawJson = JSON.parse(text);
@@ -310,27 +355,7 @@ export default async function handler(req, res) {
       } catch (e) {}
     }
 
-    // В. Если отправлена ссылка на подписку (https://...)
-    if (foundKeys.length === 0 && /^https?:\/\//i.test(text)) {
-      try {
-        const subRes = await fetch(text, { headers: { "User-Agent": "Happ/sing-box" } });
-        if (subRes.ok) {
-          const rawText = (await subRes.text()).trim();
-          let decoded = rawText;
-          try { decoded = atob(rawText); } catch (e) {}
-
-          try {
-            const parsedSubJson = JSON.parse(decoded);
-            foundKeys.push(...extractKeysFromJson(parsedSubJson));
-          } catch (e) {
-            const regex = /(vless|vmess|hysteria2|ss|trojan):\/\/[^\s<>'"]+/gi;
-            foundKeys.push(...(decoded.match(regex) || []));
-          }
-        }
-      } catch (e) {}
-    }
-
-    // Г. Поиск стандартных протоколов в тексте
+    // Г. Обычный текст с ключами
     if (foundKeys.length === 0 && text) {
       const regex = /(vless|vmess|hysteria2|ss|trojan):\/\/[^\s<>'"]+/gi;
       foundKeys.push(...(text.match(regex) || []));
@@ -344,7 +369,7 @@ export default async function handler(req, res) {
       return res.status(200).send("OK");
     }
 
-    // Сохранение во временный буфер KV
+    // Буфер в KV
     const saveResult = await putToKV(`pending::${ADMIN_ID}`, { keys: foundKeys });
 
     if (!saveResult.ok) {
